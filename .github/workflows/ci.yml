@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          cache: true
+
+      - name: format
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+
+      - name: vet
+        run: go vet ./...
+
+      # Run the purity contract as its own step so a violation is immediately
+      # legible in the CI summary rather than buried in the full test output.
+      # This is the project's foundational invariant: everything else depends
+      # on the core being deterministic and I/O-free.
+      - name: purity contract
+        run: go test ./raft -run 'TestCoreHasNo' -count=1 -v
+
+      - name: core dependency graph
+        run: go list -deps ./raft | grep -v '^internal/'
+
+      - name: test
+        run: go test ./... -count=1
+
+      - name: test (race)
+        run: go test -race ./... -count=1
+
+  # A failure here prints a single integer seed that reproduces it exactly.
+  soak:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+      - name: deterministic simulation soak
+        run: |
+          go run ./cmd/dst -soak -seeds=5000 -nodes=3 -parallel=4
+          go run ./cmd/dst -soak -seeds=5000 -nodes=5 -parallel=4

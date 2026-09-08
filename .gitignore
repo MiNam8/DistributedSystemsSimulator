@@ -1,0 +1,26 @@
+# binaries
+/bin/
+/build/
+cmd/**/kvserver
+cmd/**/kvctl
+cmd/**/dst
+
+# test & profiling output
+*.test
+*.out
+*.prof
+coverage.*
+
+# runtime data (WAL segments, snapshots, cluster scratch)
+/data/
+/tmp/
+*.wal
+*.snap
+
+# DST failure artifacts
+/seeds/
+*.trace
+
+# editor
+.vscode/
+.idea/

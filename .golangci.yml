@@ -1,0 +1,28 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - bodyclose
+    - errorlint
+    - misspell
+    - unconvert
+    - copyloopvar
+    - gocritic
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+
+  exclusions:
+    rules:
+      # Table-driven tests and fault injectors intentionally ignore errors.
+      - path: _test\.go
+        linters: [errcheck]
