@@ -79,6 +79,17 @@ type SendMessage struct {
 	Message Message
 }
 
+// RestoreStateMachine requires the state machine to be replaced wholesale by a
+// snapshot, discarding whatever it held.
+//
+// It is always preceded by a [PersistSnapshot] barrier in the same batch, so a
+// crash midway leaves either the old snapshot or the new one, never a state
+// machine restored from a snapshot that is not on disk.
+type RestoreStateMachine struct {
+	Meta SnapshotMeta
+	Data []byte
+}
+
 // ApplyEntries requires entries to be applied to the state machine. Entries are
 // always contiguous, strictly ordered by index, never above the commit index,
 // and never delivered twice.
@@ -104,15 +115,16 @@ type StateChanged struct {
 	Leader NodeID
 }
 
-func (PersistHardState) isEffect() {}
-func (PersistEntries) isEffect()   {}
-func (TruncateSuffix) isEffect()   {}
-func (CompactLog) isEffect()       {}
-func (PersistSnapshot) isEffect()  {}
-func (SendMessage) isEffect()      {}
-func (ApplyEntries) isEffect()     {}
-func (ReadIndexReady) isEffect()   {}
-func (StateChanged) isEffect()     {}
+func (PersistHardState) isEffect()    {}
+func (PersistEntries) isEffect()      {}
+func (TruncateSuffix) isEffect()      {}
+func (CompactLog) isEffect()          {}
+func (PersistSnapshot) isEffect()     {}
+func (SendMessage) isEffect()         {}
+func (RestoreStateMachine) isEffect() {}
+func (ApplyEntries) isEffect()        {}
+func (ReadIndexReady) isEffect()      {}
+func (StateChanged) isEffect()        {}
 
 // IsBarrier reports whether e is a durability barrier: an effect that must be
 // fsync'd before any later SendMessage in the same batch is transmitted. The

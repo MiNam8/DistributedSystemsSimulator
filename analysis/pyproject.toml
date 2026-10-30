@@ -1,0 +1,8 @@
+[project]
+name = "analysis"
+version = "0.1.0"
+description = "Plots for the Raft KV store benchmarks"
+requires-python = ">=3.11"
+dependencies = [
+    "matplotlib>=3.8",
+]

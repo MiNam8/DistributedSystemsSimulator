@@ -30,11 +30,55 @@ type Options struct {
 	// seeded: a global source would make simulated runs irreproducible.
 	Rand Rand
 
+	// MaxInflight bounds pipelining: AppendEntries messages that may be
+	// outstanding to one follower between heartbeats. One disables pipelining,
+	// which is kept only so its absence can be measured.
+	MaxInflight int
+
+	// PreVote makes a node poll for support before consuming a term. It costs a
+	// little failover latency and prevents a partitioned or restarting node from
+	// disrupting a healthy cluster. Off by default so its effect is measurable.
+	PreVote bool
+
+	// CheckQuorum makes a leader step down when it can no longer reach a
+	// majority. It is pre-vote's necessary partner: without it, an isolated
+	// leader's heartbeats keep its reachable followers refusing every pre-vote.
+	CheckQuorum bool
+
+	// LeaseDuration enables leader-lease reads: a leader may serve a read from
+	// local state for this long after a quorum last acknowledged it, without a
+	// confirmation round. Zero disables leases.
+	//
+	// # The clock assumption, stated plainly
+	//
+	// This is the only place in the implementation where correctness depends on
+	// clocks rather than on messages. It is safe if and only if
+	//
+	//	LeaseDuration < ElectionTimeout - (maximum clock rate error between nodes)
+	//
+	// because the argument is: no follower will start an election until its own
+	// election timeout elapses, so within that window no other node can have
+	// become leader. If this node's clock runs *slow* relative to a follower's,
+	// the follower's timeout fires before this node believes its lease expired,
+	// a new leader is elected, and this node keeps serving reads from a term it
+	// has already lost.
+	//
+	// Go's garbage collector can also pause a process for longer than a lease,
+	// with the same effect and no clock error at all. The DST harness
+	// demonstrates both — see the lease tests, which set the bound deliberately
+	// wrong and show the stale read appear.
+	LeaseDuration Duration
+
 	// Log is the recovered log. Nil means a fresh node.
 	Log *Log
 
 	// HardState is the recovered term, vote and commit index. Zero for a fresh node.
 	HardState HardState
+
+	// Now seeds the node's notion of the current time. A restarting node must
+	// pass the current clock reading, or its first Tick would look like a jump
+	// of the entire uptime and fire an election immediately.
+	Now Time
 }
 
 // Raft is the consensus state machine.
@@ -50,6 +94,10 @@ type Raft struct {
 
 	electionTimeout   Duration
 	heartbeatInterval Duration
+	maxInflight       int
+	leaseDuration     Duration
+	preVote           bool
+	checkQuorumOn     bool
 
 	// Persistent state. Any change to term or votedFor sets hsDirty, and a dirty
 	// hard state is flushed as a PersistHardState effect before any message that
@@ -69,6 +117,30 @@ type Raft struct {
 	// cluster.Voters rather than by ranging the map, for the same reason as votes.
 	prs map[NodeID]*progress
 
+	// Read state. readReqs holds in-flight ReadIndex confirmations; deferredReads
+	// are reads waiting for this leader's no-op to commit; leaseUntil is the
+	// instant the current leadership lease expires.
+	// prevConfig and pendingConfIndex support applying configuration changes on
+	// append: the previous configuration must be restorable if the entry that
+	// introduced the current one is truncated away.
+	prevConfig       Config
+	pendingConfIndex Index
+
+	// transferee is the target of an in-progress leadership handover, or None.
+	// While set, the leader refuses proposals so the target's log can converge
+	// on a fixed endpoint rather than chasing a moving one.
+	transferee       NodeID
+	transferDeadline Time
+
+	readRound     *readRound
+	readRoundSeq  uint64
+	readQueue     []uint64
+	deferredReads []uint64
+	leaseUntil    Time
+
+	leaseReads     int
+	confirmedReads int
+
 	// Candidate state. Counted by walking cluster.Voters rather than by ranging
 	// this map: Go randomises map iteration order, which would make effect order
 	// vary between runs of the same seed and quietly destroy reproducibility.
@@ -76,8 +148,14 @@ type Raft struct {
 
 	// Timing. Absolute deadlines rather than counters, so the core never needs
 	// to know how often it is ticked.
-	now               Time
-	electionDeadline  Time
+	now              Time
+	electionDeadline Time
+	// lastLeaderContact is when a leader was last heard from. Pre-vote consults
+	// it rather than electionDeadline, because the two mean different things: a
+	// node that is not a voter resets its deadline every tick without ever
+	// campaigning, and reading contentment off the deadline made such a node
+	// refuse every pre-vote forever — one learner could deadlock the cluster.
+	lastLeaderContact Time
 	heartbeatDeadline Time
 }
 
@@ -122,15 +200,60 @@ func New(opts Options) (*Raft, error) {
 		rand:              opts.Rand,
 		electionTimeout:   opts.ElectionTimeout,
 		heartbeatInterval: opts.HeartbeatInterval,
+		maxInflight:       max(opts.MaxInflight, 1),
+		leaseDuration:     opts.LeaseDuration,
+		preVote:           opts.PreVote,
+		checkQuorumOn:     opts.CheckQuorum,
 		term:              opts.HardState.Term,
 		votedFor:          opts.HardState.VotedFor,
 		commitIndex:       opts.HardState.Commit,
 		log:               log,
 		role:              Follower,
 		votes:             make(map[NodeID]bool),
+		now:               opts.Now,
 	}
+	// Rebuild the configuration by replaying every configuration entry the
+	// recovered log holds.
+	//
+	// Without this a restarting node comes back with its *bootstrap* membership
+	// and silently forgets every change since — counting quorums against a voter
+	// set that no longer exists, and in a cluster whose membership has shifted,
+	// electing leaders that a real majority never endorsed. The starting point is
+	// the snapshot's configuration (already in cluster), because entries below
+	// the snapshot boundary are folded into it.
+	r.replayConfig()
+
 	r.resetElectionDeadline()
 	return r, nil
+}
+
+// replayConfig folds every configuration entry in the log into the current
+// membership, in order.
+func (r *Raft) replayConfig() {
+	first, last := r.log.FirstIndex(), r.log.LastIndex()
+	if last < first {
+		return
+	}
+	entries, err := r.log.Slice(first, last+1)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.Type != EntryConfChange {
+			continue
+		}
+		cc, err := DecodeConfChange(e.Data)
+		if err != nil {
+			continue
+		}
+		r.prevConfig = r.cluster
+		r.cluster = applyConfChange(r.cluster, cc)
+		// Only a change above the commit index is still revocable; anything at
+		// or below it is settled and can never be truncated away.
+		if e.Index > r.commitIndex {
+			r.pendingConfIndex = e.Index
+		}
+	}
 }
 
 // ID returns this node's identity.
@@ -170,20 +293,44 @@ func (r *Raft) Tick(now Time) []Effect {
 	}
 	r.now = now
 
-	var effs []Effect
+	// After a restart the state machine is empty while commitIndex was recovered
+	// from durable state, so the log prefix below it must be replayed. Doing it
+	// here rather than only on the next commit advance means a restarted node
+	// catches up promptly instead of waiting for the next client write.
+	effs := r.applyCommitted(nil)
+
 	if r.role == Leader {
 		if now >= r.heartbeatDeadline {
 			r.heartbeatDeadline = now + Time(r.heartbeatInterval)
-			// The periodic heartbeat is a full AppendEntries carrying whatever
-			// each follower is missing, so a follower that dropped a message
-			// recovers on the next beat rather than stalling until a client
-			// happens to write again.
+			// The heartbeat is also the pipeline's resynchronisation point:
+			// the window is cleared and next is pulled back to what is actually
+			// known replicated, so anything lost in flight is retransmitted.
+			// Between heartbeats the leader runs ahead optimistically; once per
+			// interval it reconciles with reality.
+			for _, peer := range r.peers() {
+				pr := r.prs[peer]
+				pr.inflight = 0
+				pr.next = max(pr.match+1, 1)
+			}
+			r.abortStalledTransfer()
 			effs = r.broadcastAppend(effs)
+			effs = r.checkQuorum(effs)
 		}
 		return effs
 	}
 	if now >= r.electionDeadline {
-		effs = r.startElection(effs)
+		// A learner, or a node removed from the configuration, must never
+		// campaign: it cannot win, and under pre-vote it would not even be
+		// polled. Letting it try only burns terms.
+		if !r.cluster.IsVoter(r.id) {
+			r.resetElectionDeadline()
+			return effs
+		}
+		if r.preVote {
+			effs = r.startPreVote(effs)
+		} else {
+			effs = r.startElection(effs)
+		}
 	}
 	return effs
 }
@@ -191,6 +338,16 @@ func (r *Raft) Tick(now Time) []Effect {
 // Step processes an incoming message and returns the resulting effects.
 func (r *Raft) Step(m Message) []Effect {
 	var effs []Effect
+
+	// Pre-vote traffic bypasses the term rules entirely. The term it carries is
+	// the one the sender *would* campaign in, not one it holds — adopting it
+	// would recreate the exact disruption pre-vote exists to prevent.
+	switch m.Type {
+	case MsgPreVote:
+		return r.handlePreVote(effs, m)
+	case MsgPreVoteResp:
+		return r.handlePreVoteResp(effs, m)
+	}
 
 	switch {
 	case m.Term > r.term:
@@ -203,11 +360,27 @@ func (r *Raft) Step(m Message) []Effect {
 		r.becomeFollower(m.Term, None)
 
 	case m.Term < r.term:
-		// Stale message. Vote requests get an explicit rejection carrying our
-		// term so the stale candidate learns it has fallen behind and steps
-		// down, rather than retrying until its own election timeout.
-		if m.Type == MsgVote || m.Type == MsgPreVote {
-			return r.send(effs, Message{Type: respType(m.Type), To: m.From, Reject: true})
+		// Stale message. Every *request* gets an explicit rejection carrying our
+		// term, because that reply is the only way the sender learns it has
+		// fallen behind.
+		//
+		// Dropping these silently is safe but costs liveness in a way that is
+		// easy to miss: a leader deposed while partitioned keeps heartbeating
+		// its dead term forever, never steps down, and goes on telling clients
+		// it is the leader. Only a reply carrying a higher term makes it yield
+		// (§5.1).
+		//
+		// Responses are still dropped. Replying to a reply would bounce a pair
+		// of stale nodes off each other indefinitely.
+		switch m.Type {
+		case MsgVote:
+			return r.send(effs, Message{Type: MsgVoteResp, To: m.From, Reject: true})
+		case MsgApp:
+			return r.send(effs, Message{Type: MsgAppResp, To: m.From, Reject: true})
+		case MsgSnap:
+			return r.send(effs, Message{Type: MsgSnapResp, To: m.From, Reject: true})
+		case MsgHeartbeat:
+			return r.send(effs, Message{Type: MsgHeartbeatResp, To: m.From, Reject: true})
 		}
 		return nil
 	}
@@ -221,6 +394,16 @@ func (r *Raft) Step(m Message) []Effect {
 		return r.handleApp(effs, m)
 	case MsgAppResp:
 		return r.handleAppResp(effs, m)
+	case MsgSnap:
+		return r.handleSnap(effs, m)
+	case MsgSnapResp:
+		return r.handleSnapResp(effs, m)
+	case MsgHeartbeat:
+		return r.handleHeartbeat(effs, m)
+	case MsgHeartbeatResp:
+		return r.handleHeartbeatResp(effs, m)
+	case MsgTimeoutNow:
+		return r.handleTimeoutNow(effs, m)
 	default:
 		return effs
 	}
@@ -232,6 +415,15 @@ func respType(t MessageType) MessageType {
 		return MsgPreVoteResp
 	}
 	return MsgVoteResp
+}
+
+// sendWithTerm is send with an explicit term, for pre-vote traffic whose term is
+// hypothetical rather than this node's own.
+func (r *Raft) sendWithTerm(effs []Effect, m Message, term Term) []Effect {
+	effs = r.flushHardState(effs)
+	m.From = r.id
+	m.Term = term
+	return append(effs, SendMessage{Message: m})
 }
 
 // send appends a SendMessage effect, first flushing any dirty hard state.
@@ -258,9 +450,22 @@ func (r *Raft) flushHardState(effs []Effect) []Effect {
 	return append(effs, PersistHardState{HardState: r.HardState()})
 }
 
-// peers returns the other voters, in sorted order. Deterministic by
-// construction; see the note on Raft.votes.
+// peers returns every other cluster member — voters *and* learners — in sorted
+// order. Learners receive the log like anyone else; they simply do not count
+// toward a quorum.
 func (r *Raft) peers() []NodeID {
+	out := make([]NodeID, 0, len(r.cluster.Voters)+len(r.cluster.Learners))
+	for _, v := range r.cluster.Voters {
+		if v != r.id {
+			out = append(out, v)
+		}
+	}
+	out = append(out, r.cluster.Learners...)
+	return out
+}
+
+// votingPeers returns the other voters only, for elections.
+func (r *Raft) votingPeers() []NodeID {
 	out := make([]NodeID, 0, len(r.cluster.Voters))
 	for _, v := range r.cluster.Voters {
 		if v != r.id {

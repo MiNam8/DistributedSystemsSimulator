@@ -128,7 +128,16 @@ type Message struct {
 	// general.
 	ReadReqID uint64
 
-	// Snapshot is set on MsgSnap. The payload is carried out of band by the
-	// transport; the core only reasons about the metadata.
-	Snapshot *SnapshotMeta
+	// Snapshot is set on MsgSnap.
+	//
+	// On the *send* side the core fills in metadata only: it decides when a
+	// follower needs a snapshot, and the runtime loads the bytes from storage
+	// and streams them. A consensus core that held multi-megabyte payloads
+	// would put them in every effect batch and in every simulator trace.
+	//
+	// On the *receive* side the transport has already reassembled the stream, so
+	// SnapshotData is populated and the core can emit the install as ordinary,
+	// ordered effects.
+	Snapshot     *SnapshotMeta
+	SnapshotData []byte
 }

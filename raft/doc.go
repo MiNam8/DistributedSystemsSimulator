@@ -4,15 +4,21 @@
 // # The purity contract
 //
 // This package performs no I/O, starts no goroutines, reads no clock, and uses
-// no unseeded randomness. It has three entry points — [Raft.Step], [Raft.Tick]
-// and [Raft.Propose] — each of which accepts an event and returns a slice of
-// [Effect] values *describing* what must happen. The caller performs the I/O.
+// no unseeded randomness. Every entry point accepts an event and returns a
+// slice of [Effect] values *describing* what must happen. The caller performs
+// the I/O.
+//
+// The core entry points are [Raft.Step] (a message arrived), [Raft.Tick] (time
+// passed) and [Raft.Propose] (a client write). The rest follow the same
+// pattern: [Raft.ProposeBatch], [Raft.ReadIndex], [Raft.Snapshot],
+// [Raft.TransferLeadership] and [Raft.ProposeConfChange].
 //
 // This is what allows one implementation to be driven by two very different
 // harnesses: a deterministic simulator (virtual clock, seeded fault injection,
 // in-memory storage) and a real node runtime (monotonic clock, gRPC, an
 // fsync'd write-ahead log). A bug found in simulation is a bug in production,
-// and a bug seen in production can be replayed in simulation from a seed.
+// and a bug seen in production can be reproduced in simulation by recreating
+// its fault pattern, after which a seed replays it exactly.
 //
 // The contract is enforced mechanically, not by convention: purity_test.go
 // asserts that this package's *transitive* import graph contains no time, net,

@@ -1,0 +1,149 @@
+syntax = "proto3";
+
+package kvstore.v1;
+
+option go_package = "github.com/MiNam8/kvstore/proto/kvstorepb";
+
+// RaftService carries consensus traffic between peers.
+//
+// Every RPC is fire-and-forget by design: the reply is an empty acknowledgement
+// and carries no protocol meaning. Raft's transport contract is explicitly
+// unreliable — drop, delay, duplicate and reorder are all permitted — and its
+// own retries (heartbeats and nextIndex backtracking) are the recovery
+// mechanism. Making these calls request/response would layer a second, weaker
+// retry scheme on top of a correct one.
+service RaftService {
+  rpc Step(RaftMessage) returns (Ack);
+  rpc InstallSnapshot(stream SnapshotChunk) returns (Ack);
+}
+
+// KV is the client-facing API.
+service KV {
+  rpc Put(PutRequest) returns (Response);
+  rpc Get(GetRequest) returns (Response);
+  rpc Delete(DeleteRequest) returns (Response);
+  rpc CompareAndSwap(CASRequest) returns (Response);
+  rpc Status(StatusRequest) returns (StatusResponse);
+}
+
+message Ack {}
+
+message Entry {
+  uint64 index = 1;
+  uint64 term = 2;
+  uint32 type = 3;
+  bytes data = 4;
+}
+
+message RaftMessage {
+  uint32 type = 1;
+  uint64 from = 2;
+  uint64 to = 3;
+  uint64 term = 4;
+
+  uint64 last_log_index = 5;
+  uint64 last_log_term = 6;
+
+  uint64 prev_log_index = 7;
+  uint64 prev_log_term = 8;
+  repeated Entry entries = 9;
+  uint64 commit = 10;
+
+  bool reject = 11;
+  uint64 match_index = 12;
+  uint64 reject_hint_index = 13;
+  uint64 reject_hint_term = 14;
+
+  uint64 read_req_id = 15;
+}
+
+message SnapshotMeta {
+  uint64 last_included_index = 1;
+  uint64 last_included_term = 2;
+  repeated uint64 voters = 3;
+  repeated uint64 learners = 4;
+}
+
+message SnapshotChunk {
+  uint64 from = 1;
+  SnapshotMeta meta = 2;
+  bytes data = 3;
+  // The sender's term. Without it the receiver cannot tell a current leader's
+  // snapshot from one sent by a leader that was deposed while it streamed, and
+  // would install state from a term it has already moved past.
+  uint64 term = 4;
+}
+
+// Session identifies a client and its command.
+//
+// Both fields are required for every mutating request. A client that retries
+// after a timeout must resend the *same* sequence number: the state machine
+// keeps the last result per client, so the retry returns the original answer
+// instead of applying the command twice. Without this, a retry across a
+// failover is a second log entry and linearizability is broken however correct
+// the consensus layer is.
+message Session {
+  uint64 client_id = 1;
+  uint64 seq = 2;
+}
+
+message PutRequest {
+  string key = 1;
+  bytes value = 2;
+  Session session = 3;
+}
+
+message GetRequest {
+  string key = 1;
+  Session session = 2;
+}
+
+message DeleteRequest {
+  string key = 1;
+  Session session = 2;
+}
+
+message CASRequest {
+  string key = 1;
+  bytes value = 2;
+  bytes expected = 3;
+  // If false, the operation succeeds only when the key is absent — which a
+  // zero-length `expected` cannot express on its own.
+  bool has_expected = 4;
+  Session session = 5;
+}
+
+message Response {
+  bool ok = 1;
+  bytes value = 2;
+  bool found = 3;
+  // Set when this request was recognised as a retry and answered from the
+  // session table rather than executed again.
+  bool duplicate = 4;
+  // Set when this node is not the leader, so the client redirects instead of
+  // mistaking a rejection for a failed compare-and-swap.
+  bool not_leader = 5;
+  // The node this one believes is leader. Zero means unknown, and the client
+  // should try another node.
+  uint64 leader_hint = 6;
+}
+
+message StatusRequest {}
+
+message StatusResponse {
+  uint64 id = 1;
+  string role = 2;
+  uint64 term = 3;
+  uint64 leader = 4;
+  uint64 commit_index = 5;
+  uint64 applied_index = 6;
+  uint64 elections = 7;
+  uint64 applied = 8;
+  // Group-commit instrumentation: batches is the number of appends, and
+  // batched_entries the proposals they carried. Their ratio is the mean batch
+  // size, which is the direct measure of how many fsyncs were saved.
+  uint64 batches = 9;
+  uint64 batched_entries = 10;
+  uint64 max_batch = 11;
+  uint64 proposals = 12;
+}

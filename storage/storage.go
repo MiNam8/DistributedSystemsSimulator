@@ -76,3 +76,59 @@ type Storage interface {
 	// Close releases resources.
 	Close() error
 }
+
+// RecoverState rebuilds everything a restarting node needs: durable term and
+// vote, the configuration to start from, and the log.
+//
+// The configuration comes from the snapshot when there is one, and only falls
+// back to the bootstrap configuration for a node that has never run. Using the
+// bootstrap configuration when a snapshot exists silently reverts every
+// membership change the cluster has made — the node comes back counting quorums
+// against a voter set that no longer exists. The caller then replays the log's
+// configuration entries on top, which [raft.New] does.
+func RecoverState(s Storage) (raft.HardState, raft.Config, *raft.Log, error) {
+	hs, bootstrap, err := s.InitialState()
+	if err != nil {
+		return hs, bootstrap, nil, err
+	}
+	cfg := bootstrap
+	if meta, _, err := s.LoadSnapshot(); err == nil && len(meta.Config.Voters) > 0 {
+		cfg = meta.Config
+	}
+	log, err := RecoverLog(s)
+	return hs, cfg, log, err
+}
+
+// RecoverLog rebuilds the in-memory log a restarting node starts from.
+//
+// The core owns its log in memory, so recovery means handing back everything
+// durable: the snapshot boundary, then every entry above it. Both the in-memory
+// and write-ahead-log implementations go through this one function, so the
+// simulator exercises the same recovery path a real node uses.
+func RecoverLog(s Storage) (*raft.Log, error) {
+	var meta raft.SnapshotMeta
+	if m, _, err := s.LoadSnapshot(); err == nil {
+		meta = m
+	}
+	first, err := s.FirstIndex()
+	if err != nil {
+		return nil, err
+	}
+	last, err := s.LastIndex()
+	if err != nil {
+		return nil, err
+	}
+	// Start above the snapshot boundary. Compaction works at segment
+	// granularity, so storage may legitimately still hold entries below it;
+	// handing those to the core would be a non-contiguous append.
+	if first <= meta.LastIncludedIndex {
+		first = meta.LastIncludedIndex + 1
+	}
+	var entries []raft.Entry
+	if last >= first {
+		if entries, err = s.Entries(first, last+1); err != nil {
+			return nil, err
+		}
+	}
+	return raft.NewLogFrom(meta, entries), nil
+}

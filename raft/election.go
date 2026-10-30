@@ -13,6 +13,7 @@ func (r *Raft) becomeFollower(term Term, lead NodeID) {
 	r.role = Follower
 	r.leader = lead
 	r.votes = make(map[NodeID]bool)
+	r.clearReadState()
 	r.resetElectionDeadline()
 }
 
@@ -34,7 +35,7 @@ func (r *Raft) startElection(effs []Effect) []Effect {
 		return r.becomeLeader(effs)
 	}
 
-	for _, peer := range r.peers() {
+	for _, peer := range r.votingPeers() {
 		effs = r.send(effs, Message{
 			Type:         MsgVote,
 			To:           peer,
@@ -137,11 +138,17 @@ func (r *Raft) becomeLeader(effs []Effect) []Effect {
 	r.role = Leader
 	r.leader = r.id
 	r.votes = make(map[NodeID]bool)
+	r.transferee = None
 	r.heartbeatDeadline = r.now + Time(r.heartbeatInterval)
 
-	r.prs = make(map[NodeID]*progress, len(r.cluster.Voters))
+	r.prs = make(map[NodeID]*progress, len(r.cluster.Voters)+len(r.cluster.Learners))
 	for _, v := range r.cluster.Voters {
 		r.prs[v] = &progress{next: r.log.LastIndex() + 1}
+	}
+	// Learners get replication state too: they receive the log, they just never
+	// count toward a quorum.
+	for _, l := range r.cluster.Learners {
+		r.prs[l] = &progress{next: r.log.LastIndex() + 1}
 	}
 
 	effs = append(effs, StateChanged{Role: r.role, Term: r.term, Leader: r.leader})
@@ -152,8 +159,10 @@ func (r *Raft) becomeLeader(effs []Effect) []Effect {
 	// this node counts itself in the quorum for the no-op, so it must have the
 	// entry on disk before that count can influence anyone.
 	effs = append(effs, PersistEntries{Entries: []Entry{noop}})
-	r.prs[r.id].match = noop.Index
-	r.prs[r.id].next = noop.Index + 1
+	if pr, ok := r.prs[r.id]; ok {
+		pr.match = noop.Index
+		pr.next = noop.Index + 1
+	}
 
 	effs = r.maybeCommit(effs)
 	// Replicate at once rather than waiting out the first heartbeat interval:

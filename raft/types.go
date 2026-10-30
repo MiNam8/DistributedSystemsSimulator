@@ -166,6 +166,10 @@ var (
 	// leadership was lost, or a transfer is in progress.
 	ErrProposalDropped = errors.New("raft: proposal dropped")
 
+	// ErrTransferTarget means the leadership transfer target is not a voting
+	// member of the cluster.
+	ErrTransferTarget = errors.New("raft: leadership transfer target is not a voter")
+
 	// ErrConfChangeInFlight means a membership change is already uncommitted.
 	// Only one may be in flight at a time; see the §4 safety note in membership.go.
 	ErrConfChangeInFlight = errors.New("raft: a configuration change is already in flight")

@@ -160,6 +160,19 @@ func (l *Log) Compact(index Index, term Term) {
 	l.entries = rebuilt
 }
 
+// Reset discards the log entirely, replacing it with a snapshot boundary.
+//
+// This is the "otherwise, discard the entire log" half of §7, and it is not the
+// same as [Log.Compact]. Compact keeps whatever follows the boundary, which is
+// right when this node already holds the boundary entry with a matching term —
+// the Log Matching Property then says the tail is legitimate. When the boundary
+// does *not* match, the tail belongs to a different history: keeping it splices
+// a divergent suffix onto a prefix it never followed, and a node that later wins
+// an election will replicate that fabrication over entries a quorum committed.
+func (l *Log) Reset(index Index, term Term) {
+	l.entries = []Entry{{Index: index, Term: term}}
+}
+
 // IsUpToDate reports whether a candidate whose log ends at (index, term) is at
 // least as up to date as this one — Raft's election restriction (§5.4.1).
 //

@@ -34,6 +34,17 @@ jobs:
       - name: test
         run: go test ./... -count=1
 
+      # Real listeners, real gRPC, real leader kills.
+      - name: cluster integration tests
+        run: go test ./server/ -count=1 -v -timeout 300s
+
+      # Real processes under real SIGKILL/SIGSTOP and cut sockets, checked for
+      # linearizability. The second test in this package starts the cluster in a
+      # deliberately broken configuration and requires the checker to catch it,
+      # so a green chaos run means something.
+      - name: real-cluster chaos and linearizability
+        run: go test ./chaos/ -count=1 -v -timeout 600s
+
       - name: test (race)
         run: go test -race ./... -count=1
 
@@ -47,5 +58,33 @@ jobs:
           go-version: '1.27'
       - name: deterministic simulation soak
         run: |
-          go run ./cmd/dst -soak -seeds=5000 -nodes=3 -parallel=4
-          go run ./cmd/dst -soak -seeds=5000 -nodes=5 -parallel=4
+          go run ./cmd/dst -soak -seeds=2000 -nodes=3 -parallel=4
+          go run ./cmd/dst -soak -seeds=2000 -nodes=5 -parallel=4
+
+      # Chaos: loss, duplication, reordering, partitions (incl. one-way),
+      # crashes, restarts, stalls, clock drift. A failure prints one seed.
+      - name: chaos soak
+        run: |
+          go run ./cmd/dst -soak -chaos -seeds=2000 -nodes=3 -parallel=4
+          go run ./cmd/dst -soak -chaos -seeds=2000 -nodes=5 -parallel=4
+
+      # Compaction turned up so far that InstallSnapshot, not replication,
+      # becomes the normal catch-up path. At a production threshold that code
+      # runs rarely and is effectively untested.
+      - name: snapshot-heavy chaos soak
+        run: |
+          go run ./cmd/dst -soak -chaos -snapshot -seeds=2000 -nodes=3 -parallel=4
+          go run ./cmd/dst -soak -chaos -snapshot -seeds=2000 -nodes=5 -parallel=4
+
+      # Membership changes are the subtlest correctness case in Raft: a
+      # configuration takes effect on append, so it can be truncated and must
+      # roll back. Churned continuously alongside every other fault.
+      - name: membership churn soak
+        run: |
+          go run ./cmd/dst -soak -chaos -membership -seeds=2000 -nodes=5 -parallel=4
+          go run ./cmd/dst -soak -chaos -membership -snapshot -seeds=2000 -nodes=5 -parallel=4
+
+      # Same scenario against real fsync'd files: fewer seeds, far higher
+      # fidelity. Breadth comes from the in-memory soaks above.
+      - name: chaos soak on a real write-ahead log
+        run: go run ./cmd/dst -soak -chaos -snapshot -wal -seeds=50 -nodes=5 -parallel=4

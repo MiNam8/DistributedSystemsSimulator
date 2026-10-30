@@ -20,9 +20,12 @@ type Transport interface {
 	// Send transmits msg to msg.To. It must not block the caller.
 	Send(msg raft.Message)
 
-	// SendSnapshot transmits a snapshot payload out of band, since snapshots
-	// are far larger than protocol messages and must not stall replication.
-	SendSnapshot(to raft.NodeID, meta raft.SnapshotMeta, data []byte)
+	// SendSnapshot transmits a snapshot out of band, since a multi-megabyte
+	// payload must not queue ahead of the heartbeats that keep leadership alive.
+	// term is the sender's term and is as much a part of the message as the
+	// payload: a receiver that cannot check it may install state from a leader
+	// that was deposed while the transfer ran.
+	SendSnapshot(to raft.NodeID, term raft.Term, meta raft.SnapshotMeta, data []byte)
 
 	// Close releases resources.
 	Close() error
@@ -32,5 +35,5 @@ type Transport interface {
 // this and funnels every message into the single goroutine that owns the core.
 type Receiver interface {
 	Deliver(msg raft.Message)
-	DeliverSnapshot(meta raft.SnapshotMeta, data []byte)
+	DeliverSnapshot(from raft.NodeID, term raft.Term, meta raft.SnapshotMeta, data []byte)
 }
